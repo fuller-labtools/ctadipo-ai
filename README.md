@@ -73,7 +73,7 @@ The depot rules also compute several *overlapping* regions — `posterior_SUBQ_w
 
 ### Architecture
 
-**1. Landmark model** (ours; `ctadipo/landmark_model.py`, weights in `model/fold0.pt` … `model/fold4.pt`)
+**1. Landmark model** (`ctadipo/landmark_model.py`, weights in `model/fold0.pt` … `model/fold4.pt`)
 
 - **Input:** two body-masked orthogonal projections (coronal, sagittal), **four channels each** — `bone` = max inside body, `air` = min inside body, `bulk` = mean inside body, `thickness` = body depth in mm — resized to **256 (z) × 128 (lateral)**, standardised per scan over body pixels only, plus one validity channel per view = **10 input channels**.
 - **The body mask** is the largest 3-D connected component above −500 HU **with holes filled**. Filling is essential: the lungs sit below the threshold, so unfilled they are excluded and the air channels lose the one structure the thoracic landmarks are defined on.
@@ -109,40 +109,35 @@ volume → 0.15 mm isotropic → animal mask → z-score → nnU-Net (body / wal
 
 ### Performance (held-out validation)
 
-**Landmark placement.** Cross-validated on all 1,186 reviewed scans, **grouped by animal**; every number below is out of fold.
+**Landmarks** — cross-validated on all 1,186 scans, grouped by animal, out of fold:
 
-| plane | median absolute error | p90 |
+| plane | median | p90 |
 |---|---|---|
-| lung apex | **0.51 mm** | 1.54 mm |
-| diaphragm | **0.48 mm** | 2.22 mm |
-| kidney, cranial | **0.66 mm** | 2.07 mm |
-| kidney, caudal | **0.79 mm** | 2.60 mm |
-| bladder | **0.84 mm** | 2.70 mm |
+| lung apex | 0.51 mm | 1.54 mm |
+| diaphragm | 0.48 mm | 2.22 mm |
+| kidney, cranial | 0.66 mm | 2.07 mm |
+| kidney, caudal | 0.79 mm | 2.60 mm |
+| bladder | 0.84 mm | 2.70 mm |
 
-**Craniocaudal direction: 99.66%** (1,182 / 1,186). The four misses are not silent: on those the apex and bladder come out **0.4–25.1 mm** apart, against a **1st percentile of 29.4 mm** when the call is right — so a **margin under 28 mm flags all four while flagging under 1% of scans**. This matters because a direction flip swaps anterior with gluteal, and retroperitoneal with perigonadal, while conservation holds exactly and every total looks perfectly normal.
+6.2% of scans miss by more than 5 mm somewhere; the confidence flag catches 73% of those. Craniocaudal direction is right on **99.66%** (1,182 / 1,186), and all four misses are caught by an apex-to-bladder margin under 28 mm.
 
-**Where it fails.** **6.2%** of scans exceed 5 mm on at least one plane and **2.0%** exceed 10 mm. The confidence flag catches **73% of the > 5 mm cases** at the cost of flagging **10.9%** of scans. That is useful, not a guarantee — look at the 3-D view.
+**Effect on the numbers** — 60 scans, model landmarks against expert, identical masks:
 
-**What that means for the depot volumes.** Millimetres of plane are only a proxy; millilitres of named depot are the main output. So it was measured directly: **60 scans, the model's landmarks against the expert's, with identical masks in both arms**, so the annotation is the only variable.
+- Total fat, VAT and SUBQ: **0.00% difference**. Landmarks move fat between depots; they don't create it.
+- Per depot: **1.2–8.1% median**, and 0.01–0.10 mL in absolute terms whatever the depot's size.
+- A small depot on a single scan can still differ by tens of percent (p90 ≈ 50%).
 
-- Median difference per depot ranges from **1.2% (perigonadal)** to **8.1% (inguinal)**; in absolute terms **0.01–0.10 mL** in every depot regardless of its size, which is what a ~1 mm plane shift moving a thin sheet of fat across a boundary looks like. It does not compound.
-- **Total fat, VAT and SUBQ are unaffected — 0.00% median difference** — because landmarks only redistribute fat between slabs and cannot change how much of it there is.
-- **Direction agreed on 60/60**, and no scan failed to partition.
+Treat the totals as exact, the large depots as precise, the small ones as indicative.
 
-**But an individual small depot on an individual scan can differ by tens of percent.** The percentage is larger on small depots only because they are small; at the p90 the per-scan difference reaches roughly 50% for thoracic and 48% for inguinal. Treat the large depots as precise, the small ones as indicative, and the totals as exact.
+**Runtime**, one scan on CPU:
 
-**The rest of the chain.** Preprocessing reproduces the source pipeline **bit-exactly** — body, cavity, fat, VAT and SUBQ masks — so the compartment totals depend only on the segmentation and the HU band, neither of which the landmark model touches.
-
-**Runtime (CPU, one scan; measured on a 489 × 427 × 427 volume — a 540 × 529 × 529 is ~1.7× more):**
-
-| cores | fast mode (no mirroring) | mirroring on |
+| machine | fast mode | mirroring on |
 |---|---|---|
-| 2 | 75 s | ~10 min |
-| 8 | 46 s | ~6 min |
+| 2 cores | 75 s | ~10 min |
+| 8 cores | 46 s | ~6 min |
+| 24 cores | 3–5 min | 11 min |
 
-Re-measured end to end on a 540 × 529 × 529 scan on the 24-core desktop in 1.3: **11.2 min with mirroring against 3.2 min without**. So fast mode is roughly **3–4× faster, not 8×**, and wall clock moves with machine load — the same fast run took 3.2 and 4.7 min on two attempts. Read the table as an order of magnitude, not a specification.
-
-On that scan, a lean animal with 1.06 mL of fat, turning mirroring off moved total fat by **+1.9%** (1.064 → 1.084 mL). Across the six scans it was measured on the median shift is **−0.02%** with a worst case of 2.7% — so the effect is small in the middle of the range and not small in the tail. **Fast mode is for triage; the published configuration is mirroring on.**
+The 24-core row is a 1.7× larger volume, and wall clock moves with load. Fast mode is ~3–4× quicker and shifts total fat by −0.02% median, but +1.9% on a lean animal — use it for triage; the published configuration is mirroring on.
 
 ---
 
