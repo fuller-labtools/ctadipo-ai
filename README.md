@@ -10,17 +10,15 @@
 
 ## CTAdipo — Model Overview
 
-**CTAdipo** measures **visceral (VAT)** and **subcutaneous (SUBQ)** adipose tissue, plus **ten named sub-depots**, from a **microCT volume** of a mouse. One upload in; volumes in millilitres and masses in grams out, with quality flags and rotatable 3-D renders. It couples a segmentation model (body / abdominal wall / cavity), a landmark model that places five craniocaudal anatomical planes, and the lab's validated depot-measurement code, called unchanged. **Try the online version:** https://fullerlabtools.shinyapps.io/ctadipo/
+**CTAdipo** measures **visceral (VAT)** and **subcutaneous (SUBQ)** adipose tissue, plus **ten named sub-depots**, from a **microCT volume** of a mouse. One upload in; volumes in millilitres and masses in grams out, with quality flags and rotatable 3-D renders. It couples a segmentation model (body / abdominal wall / cavity), a landmark model that places five craniocaudal anatomical planes, and the lab's validated depot-measurement code. **Try the online version:** https://fullerlabtools.shinyapps.io/ctadipo/
 
-Sibling tool to **DEXAdipo** (https://github.com/fuller-labtools/dexadipo-ai), which predicts the same two compartments from a planar DEXA image. CTAdipo does what a projection cannot: it cuts the animal in cross-section and separates the compartments at the abdominal wall.
+Sibling tool to **DEXAdipo** (https://github.com/fuller-labtools/dexadipo-ai), which predicts the same two compartments from a planar DEXA image.
 
 ---
 
 ### Why this model?
 
-A volumetric CT already contains the information needed to separate visceral from subcutaneous fat and to name the individual depots — but extracting it has required a human. In the pipeline this tool is derived from, a reviewer read five anatomical planes and the craniocaudal direction off every scan, one scan at a time, and an external organ-segmentation model seeded those planes.
-
-CTAdipo removes that step. The five planes are predicted directly from the volume, the head-to-tail direction falls out of them (the lung apex is either cranial or caudal of the bladder), and the dorsoventral axis comes from geometry with a manual override. What is left for the user is one upload and one number — the voxel size.
+A volumetric CT already contains the information needed to separate visceral from subcutaneous fat and to name the individual depots — but extracting it has required a human. CTAdipo removes that step. The five planes are predicted directly from the volume, the head-to-tail direction falls out of them (the lung apex is either cranial or caudal of the bladder), and the dorsoventral axis comes from geometry with a manual override. What is left for the user is one upload and one number — the voxel size.
 
 ---
 
@@ -62,10 +60,9 @@ The depot rules also compute several *overlapping* regions — `posterior_SUBQ_w
 
 **Landmark model**
 
-- **Data:** **1,186 expert-reviewed scans from 856 animals**, acquired on two scanners. 637 animals were scanned once, 108 twice and 111 three times, so **549 of the 1,186 scans share an animal with another scan** — which is why the validation split below is grouped by animal and not by scan. All of that is checkable from `model/oof.npz`, which carries an anonymous animal index and the fold assignment behind every number in this README.
+- **Data:** **1,186 expert-reviewed scans from 856 animals**, acquired on two scanners. 637 animals were scanned once, 108 twice and 111 three times, so **549 of the 1,186 scans share an animal with another scan**
 - **Labels:** the five craniocaudal planes as placed and corrected by an expert reviewer, scan by scan.
 - **Validation split:** **5-fold cross-validation, grouped by animal.** The cohort scans the same mouse at up to three timepoints, so a per-scan split would put one animal's baseline in training and its 12-month scan in validation, and report a number that means nothing for a new mouse.
-- **Craniocaudal direction** is not a separate label: it is whether the predicted lung apex is cranial of the predicted bladder.
 
 **Segmentation model**
 
@@ -126,7 +123,7 @@ volume → 0.15 mm isotropic → animal mask → z-score → nnU-Net (body / wal
 
 **Where it fails.** **6.2%** of scans exceed 5 mm on at least one plane and **2.0%** exceed 10 mm. The confidence flag catches **73% of the > 5 mm cases** at the cost of flagging **10.9%** of scans. That is useful, not a guarantee — look at the 3-D view.
 
-**What that means for the depot volumes.** Millimetres of plane are only a proxy; millilitres of named depot are the thing. So it was measured directly: **60 scans, the model's landmarks against the expert's, with identical masks in both arms**, so the annotation is the only variable.
+**What that means for the depot volumes.** Millimetres of plane are only a proxy; millilitres of named depot are the main output. So it was measured directly: **60 scans, the model's landmarks against the expert's, with identical masks in both arms**, so the annotation is the only variable.
 
 - Median difference per depot ranges from **1.2% (perigonadal)** to **8.1% (inguinal)**; in absolute terms **0.01–0.10 mL** in every depot regardless of its size, which is what a ~1 mm plane shift moving a thin sheet of fat across a boundary looks like. It does not compound.
 - **Total fat, VAT and SUBQ are unaffected — 0.00% median difference** — because landmarks only redistribute fat between slabs and cannot change how much of it there is.
@@ -138,7 +135,7 @@ volume → 0.15 mm isotropic → animal mask → z-score → nnU-Net (body / wal
 
 **Runtime (CPU, one scan; measured on a 489 × 427 × 427 volume — a 540 × 529 × 529 is ~1.7× more):**
 
-| cores | fast mode (no mirroring) | mirroring on (default; matches the published numbers) |
+| cores | fast mode (no mirroring) | mirroring on |
 |---|---|---|
 | 2 | 75 s | ~10 min |
 | 8 | 46 s | ~6 min |
@@ -152,13 +149,9 @@ On that scan, a lean animal with 1.06 mL of fat, turning mirroring off moved tot
 ### Intended use & limitations
 
 - **Research use only**; not a clinical or diagnostic device.
-- **Hardware-specific holder geometry is deliberately not shipped, and fused hardware may be counted as fat.** The source pipeline subtracts hand-drawn polygons keyed to scanner *and* reconstruction crop, because on that rig a breathing pad fuses to the animal and its dark interior is labelled cavity — i.e. counted as visceral fat. Those polygons cannot transfer to another scanner. CTAdipo does only what generalises (`keep_largest3d`, which removes *detached* hardware) and **shows you the mask** instead of pretending the problem is solved. Look at the 3-D view.
-- **Dorsoventral orientation is not validated for a differently-mounted animal.** All 1,186 training scans share one orientation, so there are no examples of the other and no evidence either way about an animal mounted differently. The axis is decided from geometry, the decision margin is surfaced, and the sidebar has a manual override — but not validated means not validated. Check the 3-D view.
+- **Hardware-specific holder geometry is deliberately not shipped, and fused hardware may be counted as fat.** The source pipeline subtracts hand-drawn polygons keyed to scanner *and* reconstruction crop, because on that rig a breathing pad fuses to the animal and its dark interior is labelled cavity — i.e. counted as visceral fat. Those polygons cannot transfer to another scanner. CTAdipo does only what generalises (`keep_largest3d`, which removes *detached* hardware) and **shows you the mask**
 - **The data is not HU-calibrated**, so the fat band is chosen per scan from its own air percentile rather than from an assumed calibration. A genuinely HU-calibrated scan puts adipose at roughly −190 to −30 HU, which barely overlaps either band; such a scan is flagged as having implausibly little fat in the band rather than being reported as ~0 mL with a clean panel.
 - **Voxel size is not recoverable from the image.** For NumPy and plain TIFF it must be entered, and nothing downstream can detect a wrong value — every volume scales with its cube.
-- **The VAT/SUBQ split rests on one boundary.** Where the model does not find abdominal wall, the cavity is unanchored: both totals still look reasonable and the split between them means nothing. This is measured and flagged, never assumed.
-- **Performance outside the training distribution is unknown.** These are mice, on two microCT scanners, in one mounting orientation. Other species, other geometries and clinical CT are out of scope, and extreme phenotypes or protocols unlike the training data may degrade; consider retraining with your own examples.
-
 ---
 
 ### Getting started (quick)
