@@ -18,6 +18,7 @@ import gc
 import os
 import sys
 import threading
+import time
 import traceback
 from functools import lru_cache
 from pathlib import Path
@@ -56,6 +57,9 @@ VOX_MIN, VOX_MAX = 0.005, 1.0
 BYTES_PER_VOXEL = 40
 MEM_BUDGET_GB = float(os.environ.get("CTADIPO_MEM_BUDGET_GB", "6.1"))
 MAX_OUTPUT_VOXELS = int(MEM_BUDGET_GB * 1e9 / BYTES_PER_VOXEL)
+# pipeline._budget_check reads the environment, and an unset variable there would fall back to a
+# figure for a workstation. Publish the app's real budget so both halves agree on 6.1.
+os.environ["CTADIPO_MEM_BUDGET_GB"] = repr(MEM_BUDGET_GB)
 MIN_Z_AFTER_RESAMPLE = 128               # fewer slices than this cannot carry five landmark planes
 
 DEPOT_LABEL = {
@@ -103,6 +107,81 @@ def _landmark_nets():
     return LMM.load(MODEL_DIR, device="cpu")
 
 
+# ---- one progress bar, one task at a time ------------------------------------------------------
+#
+# Two kinds of progress are mixed here and the difference is worth being honest about.
+#
+# The DOWNLOAD reports real bytes: ensure_checkpoint calls back with a true fraction, so that bar
+# means what it says. Every other stage is a single opaque call -- nnU-Net runs with allow_tqdm off
+# and exposes no sub-progress at all, and it is the twelve-minute one -- so those bars fill against
+# a MEASURED EXPECTED DURATION and are capped at 99% until the stage reports that it has finished.
+# They estimate elapsed time, not work done, and on a slow worker they will sit at 99%.
+#
+# The seconds below come from the container log of a real run on the 2-core worker, not from a
+# guess: finding 17 s, normalising 1 s, segmenting 703 s, fat 50 s, landmarks 11 s.
+_PROG = {"label": "", "frac": 0.0, "t0": 0.0, "expect": 0.0, "real": False, "detail": ""}
+
+_STAGES = [
+    ("finding the animal",       "Finding the animal",                20),
+    ("normalising",              "Normalising",                        6),
+    ("segmenting",               "Segmenting body, wall and cavity", 700),
+    ("measuring fat",            "Measuring fat",                     55),
+    ("placing landmarks",        "Placing landmarks",                 15),
+    ("partitioning into depots", "Partitioning into depots",          40),
+    ("building the 3-D view",    "Building the 3-D view",             60),
+]
+
+
+def _prog_start(label, expect=0.0, real=False):
+    _PROG.update(label=label, t0=time.time(), expect=float(expect),
+                 frac=0.0, real=bool(real), detail="")
+
+
+def _prog_set(frac, detail=""):
+    _PROG["frac"] = max(0.0, min(1.0, float(frac)))
+    _PROG["real"] = True
+    if detail:
+        _PROG["detail"] = detail
+
+
+def _prog_read():
+    """(label, percent, detail), percent real where the stage reports it and elapsed/expected
+    otherwise -- never 100% until the stage has actually said so."""
+    if not _PROG["label"]:
+        return "", 0, ""
+    if _PROG["real"]:
+        pct = 100.0 * _PROG["frac"]
+    elif _PROG["expect"] > 0 and _PROG["t0"]:
+        pct = min(99.0, 100.0 * (time.time() - _PROG["t0"]) / _PROG["expect"])
+    else:
+        pct = 0.0
+    return _PROG["label"], int(pct), _PROG["detail"]
+
+
+def _prog_busy():
+    """True while something worth a bar is in flight, INCLUDING the model download that starts on
+    upload -- before Run is ever clicked, and while _measure.status() is still idle."""
+    return bool(_PROG["label"]) and _PROG["label"] not in ("Model ready", "Done")
+
+
+def _prog_stage(msg, fast=True):
+    """Map a worker message to a new task, or fold it into the current one as detail.
+
+    "cropped 540x529x529 to 530x159x182, keeping 10%" is information ABOUT the stage in flight, not
+    a new stage. Restarting the bar on those would make it jump backwards.
+    """
+    for key, label, secs in _STAGES:
+        if msg.startswith(key):
+            if key == "segmenting" and not fast:
+                secs = secs * 3.7          # mirroring is roughly 3-4x the work
+            _prog_start(label, secs)
+            return
+    if msg.startswith("done"):
+        _PROG.update(label="Done", frac=1.0, real=True, detail="")
+        return
+    _PROG["detail"] = msg
+
+
 _SEG_LOCK = threading.Lock()
 _SEG_CACHE: dict = {}
 
@@ -130,6 +209,19 @@ def _segmenter(mirroring: bool, progress=None):
 
 # Only one measurement may run per process. See _measure_blocking for why this lives here
 # rather than in the platform's connection cap.
+def _safe_err(e):
+    """An exception message with filesystem paths removed.
+
+    Only the reason survives, because the paths in these messages are the SERVER's, not the
+    user's: they name the shiny upload directory and the deployment root.
+    """
+    import re
+    msg = str(e) or type(e).__name__
+    msg = re.sub(r"[A-Za-z]:\\[^\s'\"]+", "<file>", msg)      # windows
+    msg = re.sub(r"(?<![\w])/[\w./-]{4,}", "<file>", msg)      # posix
+    return msg[:300]
+
+
 _MEASURE_SLOT = threading.Semaphore(1)
 
 _PREFETCH_STARTED = threading.Event()
@@ -156,7 +248,10 @@ def _prefetch_model():
     def work():
         try:
             from ctadipo import models
-            models.ensure_checkpoint(results_root=NNUNET_RESULTS_ENV)
+            _prog_start("Downloading the model", real=True)
+            models.ensure_checkpoint(results_root=NNUNET_RESULTS_ENV,
+                                     progress=lambda f, m: _prog_set(f, m))
+            _PROG.update(label="Model ready", frac=1.0, real=True, detail="")
         except Exception:
             _PREFETCH_STARTED.clear()          # let the run retry, and report properly if it fails
 
@@ -229,6 +324,26 @@ def models_status():
 # -----------------------------
 # Styling - matched to the DEXAdipo app
 # -----------------------------
+# ---- plotly.js, served from the bundle rather than fetched from a CDN --------------------------
+#
+# to_html(include_plotlyjs="cdn") writes a <script src=...> for the library PLUS an inline call to
+# Plotly.newPlot into the dynamic output. Shiny injects that HTML after the page is already up, so
+# the inline call can run before the library has finished downloading -- and the user gets a
+# correctly sized, completely blank 620px box. That is exactly what the first successful run
+# produced: "there is just a large white space".
+#
+# Loading the library once in the HEAD removes the ordering race. Serving plotly's OWN bundled copy
+# rather than cdn.plot.ly removes the network dependency too, so it also works behind a firewall
+# that blocks the CDN, and the served version always matches the installed plotly that generated
+# the figure JSON.
+#
+# The src MUST be relative. On shinyapps the app is mounted at /<name>/, so "/plotlyjs/..." would
+# resolve against the domain root and 404.
+import plotly as _plotly                                            # noqa: E402
+
+_PLOTLY_DIR = Path(_plotly.__file__).parent / "package_data"
+_PLOTLY_JS = "plotlyjs/plotly.min.js"
+
 custom_css = ui.tags.style("""
 .btn-wide { width: 100%; }
 .btn-lg   { font-size: 1.1rem; padding: 0.8rem 1rem; }
@@ -255,6 +370,12 @@ custom_css = ui.tags.style("""
 .scan-meta { font-size: 0.92rem; color: #444; }
 .scan-meta code { color: #003761; }
 .prov { color: #F78800; font-weight: 600; }
+.prog-wrap  { margin: 0.5rem 0 0.3rem; }
+.prog-label { font-weight: 600; color: #003761; margin-bottom: 0.3rem; }
+.prog-track { height: 14px; background: #e7ecf2; border-radius: 7px; overflow: hidden; }
+.prog-fill  { height: 100%; background: #F78800; border-radius: 7px;
+              transition: width 0.6s linear; }
+.prog-pct   { font-size: 0.85rem; color: #444; margin: 0.3rem 0 0.2rem; }
 """)
 
 app_ui = ui.page_sidebar(
@@ -291,6 +412,7 @@ app_ui = ui.page_sidebar(
         open="open",
     ),
 
+    ui.head_content(ui.tags.script(src=_PLOTLY_JS)),
     custom_css,
 
     ui.h4(ui.tags.strong("Welcome to CTAdipo, a tool to measure adipose tissue depots in mice "
@@ -309,6 +431,8 @@ app_ui = ui.page_sidebar(
     ),
 
     ui.hr(),
+    ui.output_ui("progress_panel"),
+
     ui.h4("Scan quality"),
     ui.output_ui("quality_panel"),
 
@@ -319,6 +443,7 @@ app_ui = ui.page_sidebar(
     ui.h4("Results"),
     ui.output_ui("totals_panel"),
     ui.output_data_frame("depot_table"),
+    ui.output_ui("depot_note"),
     ui.output_ui("run_log"),
     title=None,
 )
@@ -361,6 +486,13 @@ def server(input, output, session):
                             ui.HTML("<br>".join(blocking)), class_="scan-meta flag-bad mb-2"),
                 ui.input_action_button("run", "Measure adipose depots",
                                        class_="btn-secondary btn-lg btn-wide", disabled=True))
+        # DISABLE IT WHILE A MEASUREMENT IS IN FLIGHT. ExtendedTask.invoke QUEUES a second
+        # invocation rather than ignoring it, so a second click bought a whole extra ten-minute
+        # run that the user never asked for and could not cancel.
+        if _measure.status() == "running":
+            return ui.TagList(
+                ui.input_action_button("run", "Measuring\u2026",
+                                       class_="btn-secondary btn-lg btn-wide", disabled=True))
         return ui.TagList(
             ui.tags.div(ui.tags.small(notice), class_="scan-meta flag-warn mb-2")
             if notice else ui.TagList(),
@@ -400,7 +532,12 @@ def server(input, output, session):
             _prefetch_model()
         except Exception as e:
             loaded.set(None)
-            logmsg.set("Could not read that upload.\n\n%s" % e)
+            # The message, not the path. Several readers put the file they failed on into the
+            # exception, and on a multi-file upload that is an absolute server path
+            # (/srv/connect/apps/...) rendered into a public page. The detail goes to the
+            # container log, where it is useful and not visible to the internet.
+            traceback.print_exc()
+            logmsg.set("Could not read that upload.\n\n%s" % _safe_err(e))
 
     @render.ui
     def upload_summary():
@@ -470,6 +607,13 @@ def server(input, output, session):
     def _measure_blocking(raw_vol, spacing, fast, dorsal, aid):
         """Runs in a worker thread. Touches no Shiny API; only appends to `steps`."""
         def say(msg):
+            # PRINT AS WELL AS APPEND. These lines used to go only to the browser, so the container
+            # log showed pipeline's stages and then nothing -- and "partitioning into depots" being
+            # the last line before an OOM was read as proof the partition was at fault, when it was
+            # equally consistent with dying in check_partition or in the mesh loop below. The log
+            # could not tell them apart. Same format as pipeline.say so the two interleave.
+            print("[ctadipo] %-38s rss %.2f GB" % (msg, pipeline.rss_gb()), flush=True)
+            _prog_stage(msg, fast)
             steps.append(msg)
 
         # ONE MEASUREMENT AT A TIME PER PROCESS. A single scan peaks at 5-6 GB, so two running
@@ -505,13 +649,19 @@ def server(input, output, session):
             # inside the worker thread, reporting through the same channel as everything else.
             # Held in a dict, not a local: the weights are released mid-run, and a local name
             # would keep them alive no matter what the cache does.
-            seg_holder = {"seg": _segmenter(not fast, progress=lambda frac, msg: say(msg))}
+            _prog_start("Downloading the model", real=True)
+            seg_holder = {"seg": _segmenter(not fast,
+                                            progress=lambda frac, msg: (_prog_set(frac, msg),
+                                                                        say(msg)))}
             lung, lung_note = _lung_fn()
 
             def _drop_segmenter():
                 _release_segmenter()      # the process-wide cache
                 seg_holder.clear()        # and this run's own reference
                 gc.collect()
+                # ...and give the 1.07 GB back to the KERNEL, not just to glibc's free list,
+                # because the container's limit is measured on RSS. See pipeline.trim_heap.
+                pipeline.trim_heap()
 
             out = pipeline.analyse(raw, seg_holder["seg"], nets, lung_fn=lung, device="cpu",
                                    dorsal_is_low=dorsal, depot_rules=_depot_rules()[0],
@@ -530,14 +680,46 @@ def server(input, output, session):
             # which is what made a SECOND scan fail on an 8 GB worker.
             say("building the 3-D view")
             meshes = {}
-            for k, m in list(out.get("depots", {}).get("masks", {}).items()):
-                if k not in pipeline.PARTITION_DEPOTS:
-                    continue
-                built = R3.mesh(np.asarray(m), step=3, smooth=1.2)
+            held = out.get("depots", {}).get("masks", {})
+            # Pop rather than iterate: a mask is dead the moment its mesh exists, and holding all
+            # ten to the end of the loop keeps the last one's worth of memory alive ten times over
+            # for no reason. say() now reports RSS per depot, so the log shows the loop's profile.
+            for k in [k for k in pipeline.PARTITION_DEPOTS if k in held]:
+                m = np.asarray(held.pop(k))
+                # step=2, smooth=0.5 -- MEASURED, not chosen by eye. The depots are thin
+                # sheets, and the old step=3 / sigma=1.2 blurred them below the 0.5 iso-level, so
+                # marching cubes returned a fragment or nothing at all. Measured as the fraction of
+                # each mask's own extent the mesh still spans, the old settings drew inguinal at
+                # 3%, thoracic at 11%, hindlimb at 31% and head_neck -- the LARGEST depot in the
+                # animal -- at 44%, and lost mesenteric, retroperitoneal and dorsolumbar entirely.
+                # A view that shrinks a depot to a twentieth of its size is not a cosmetic problem.
+                #
+                # These settings hold 85-99% on all ten. step=1 reaches 100% but costs 130k
+                # vertices for a single depot, four times the payload for a few percent of extent.
+                built = R3.mesh(m, step=2, smooth=0.5, min_voxels=120)
+                del m
                 if built is None:
                     continue
                 v, f, note = R3.decimate(*built, target_faces=20000)
+                del built
                 meshes[k] = (v, f, note)
+            held.clear()
+
+            # The animal, as a translucent shell around the depots.
+            body = out.get("depots", {}).pop("body", None)
+            if body is not None:
+                say("building the animal outline")
+                b = R3.largest_component(np.asarray(body))      # drop bedding and detached specks
+                del body
+                built = R3.mesh(b, step=4, close_mm=0.9, smooth=1.4, min_voxels=5000)
+                del b
+                if built is not None:
+                    v, f, _note = R3.decimate(*built, target_faces=30000)
+                    meshes["_body"] = (v, f, "")
+                del built
+            gc.collect()
+            pipeline.trim_heap()
+            say("meshed %d depots" % len(meshes))
             if "depots" in out:
                 out["depots"].pop("masks", None)
                 out["depots"].pop("frame", None)
@@ -581,9 +763,21 @@ def server(input, output, session):
     @reactive.effect
     def _collect():
         st = _measure.status()
+        # Tick for the download as well: it runs in the prefetch thread while the status is still
+        # idle, so gating the ticker on "running" left the one real-percentage bar frozen.
+        if os.environ.get("CTADIPO_TRACE"):
+            print("[trace] _collect tick: status=%r busy=%s" % (st, _prog_busy()), flush=True)
+        if st == "running" or _prog_busy():
+            reactive.invalidate_later(0.5)
+            # ISOLATE THE READ. `ticks.set(ticks() + 1)` reads ticks inside this effect, which
+            # makes the effect DEPEND on ticks -- so setting it invalidates the effect, which
+            # re-runs and sets it again, forever. Measured: 59,184 renders of quality_panel in a
+            # single run. The event loop spins on the reactive graph and never flushes an output
+            # to the browser, so every output sits on "recalculating" for the whole run and the
+            # page appears frozen. This is why no progress has ever been visible, bar or not.
+            with reactive.isolate():
+                ticks.set(ticks() + 1)
         if st == "running":
-            reactive.invalidate_later(1.0)
-            ticks.set(ticks() + 1)
             return
         if st == "success":
             try:
@@ -605,13 +799,35 @@ def server(input, output, session):
 
     # ---- output -------------------------------------------------------------------------------
     @render.ui
+    def progress_panel():
+        """The bar, on its own, ABOVE the results sections rather than inside Scan quality.
+
+        It used to BE the quality panel, so during a run the bar appeared underneath a heading
+        reading "Scan quality", which is not what it is.
+        """
+        running = _measure.status() == "running"
+        if not (running or (_PROG["label"] and result() is None)):
+            return ui.TagList()
+        ticks()
+        done = list(steps)
+        label, pct, detail = _prog_read()
+        return ui.tags.div(
+            ui.tags.div(label or "Starting", class_="prog-label"),
+            ui.tags.div(ui.tags.div(style="width:%d%%" % pct, class_="prog-fill"),
+                        class_="prog-track"),
+            ui.tags.div("%d%%%s" % (pct, ("  \u2014  " + detail) if detail else ""),
+                        class_="prog-pct"),
+            ui.tags.small(("task %d of %d" % (min(len(done), len(_STAGES)), len(_STAGES)))
+                          if running else "the model is fetched once, then cached",
+                          class_="scan-meta"),
+            class_="prog-wrap")
+
+    @render.ui
     def quality_panel():
         if _measure.status() == "running":
             ticks()
-            done = list(steps)
-            return ui.tags.div(
-                ui.tags.strong("Measuring… "), done[-1] if done else "starting",
-                ui.tags.br(), ui.tags.small("step %d" % len(done)), class_="scan-meta")
+            return ui.tags.p("Measuring — the flags appear when it finishes.",
+                             class_="scan-meta")
         r = result()
         if r is None:
             return ui.tags.p("No scan measured yet.", class_="scan-meta")
@@ -628,9 +844,9 @@ def server(input, output, session):
                 flag(q["cavity_ok"], "the VAT/SUBQ split is anchored",
                      "the wall is too thin to anchor the cavity, so the VAT/SUBQ SPLIT is "
                      "untrustworthy on this scan (the total is not)", warn=True),
-                (ui.tags.span(" Wall volume passes, but only %.0f%% of the cavity edge lies "
-                              "against it, against 45-65%% on scans an expert judged good. "
-                              "Worth checking the 3-D view."
+                (ui.tags.span(" Only %.0f%% of the cavity edge lies against the wall, which is "
+                              "low enough to be worth a look at the 3-D view. The totals are "
+                              "unaffected."
                               % (100 * q["edge_on_wall"]), class_="flag-warn")
                  if q["cavity_ok"] and q.get("edge_on_wall_low") else "")),
             ui.tags.li("Landmarks ", flag(q["landmarks_ordered"], "in anatomical order",
@@ -646,7 +862,9 @@ def server(input, output, session):
         wide = [k for k, v in q["landmark_uncertain"].items() if v]
         rows.append(ui.tags.li("Landmark confidence — ",
                                flag(not wide, "all five placed confidently",
-                                    "uncertain: %s. This scan may not resemble the training data."
+                                    "wide spread on %s — worth checking those planes in the "
+                                    "3-D view. Total fat, VAT and SUBQ are unaffected; landmarks "
+                                    "only move fat between depots."
                                     % ", ".join(wide), warn=True)))
         rows.append(ui.tags.li(
             "Lung ", flag(q["lung_subtracted"],
@@ -714,6 +932,13 @@ def server(input, output, session):
         try:
             import plotly.io as pio
             traces, dropped = [], []
+            # The shell goes in FIRST so the depots read as being inside it. It is deliberately
+            # very transparent and takes no hover, so it never steals a tooltip from a depot.
+            got_body = r.get("meshes", {}).get("_body")
+            if got_body:
+                bv, bf, _ = got_body
+                traces.append(R3.plotly_mesh(bv, bf, "#9fb0bf", "Animal",
+                                             opacity=0.14, hover=False))
             # The meshes were built in the worker thread and the masks freed there; drawing now
             # only assembles traces from a few hundred kilobytes of vertices.
             for k in pipeline.PARTITION_DEPOTS:
@@ -728,13 +953,38 @@ def server(input, output, session):
             if not traces:
                 return ui.tags.p("Nothing large enough to draw.", class_="scan-meta")
             fig = R3.scene(traces)
-            html = pio.to_html(fig, full_html=False, include_plotlyjs="cdn",
+            hint = ui.tags.p(
+                ui.HTML("Drag to rotate, scroll to zoom. <b>Click a name in the legend to hide or "
+                        "show that depot</b> \u2014 hiding the outer ones is the only way to see "
+                        "what is underneath. Double-click a name to isolate it on its own."),
+                class_="scan-meta")
+            # False, not "cdn": the library is already in the head (see _PLOTLY_JS).
+            html = pio.to_html(fig, full_html=False, include_plotlyjs=False,
                                default_height="620px")
             warn = ui.tags.p(ui.tags.small(dropped[0]), class_="scan-meta flag-warn") \
                 if dropped else ui.TagList()
-            return ui.TagList(warn, ui.HTML(html))
+            return ui.TagList(hint, warn, ui.HTML(html))
         except Exception as e:
             return ui.tags.p("Could not build the 3-D view: %s" % e, class_="scan-meta")
+
+    @render.ui
+    def depot_note():
+        """Say what the asterisk means. It marked two depots and defined itself nowhere."""
+        if result() is None:
+            return ui.TagList()
+        prov = getattr(_depot_rules()[0], "PROVISIONAL", set()) if _depot_rules()[0] else set()
+        shown = [DEPOT_LABEL[k] for k in pipeline.PARTITION_DEPOTS if k in prov]
+        if not shown:
+            return ui.TagList()
+        return ui.tags.p(
+            ui.HTML(
+                "<b>*</b> <b>Provisional boundary</b> (%s). The fat is real and is counted "
+                "correctly in VAT, SUBQ and the total \u2014 what is unsettled is where the line "
+                "between this depot and its neighbour is drawn. Mesenteric is the known hard case: "
+                "separating it from perigonadal on CT is not a solved problem. Treat these two as "
+                "indicative and check them in the 3-D view before quoting them."
+                % ", ".join(shown)),
+            class_="scan-meta")
 
     @render.ui
     def run_log():
@@ -767,4 +1017,4 @@ def server(input, output, session):
         yield out.to_csv(index=False)
 
 
-app = App(app_ui, server)
+app = App(app_ui, server, static_assets={"/plotlyjs": _PLOTLY_DIR})

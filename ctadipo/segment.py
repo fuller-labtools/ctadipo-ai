@@ -85,8 +85,27 @@ def load_segmenter(results_root, device="cpu", mirroring=True, threads=None, ste
     import torch
     from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 
-    if threads is None:
+    auto = threads is None
+    if auto:
         threads = _usable_cpus()
+    usable = max(1, int(threads))
+    # RESERVE ONE CORE FOR THE EVENT LOOP.
+    #
+    # nnU-Net saturates every thread it is given, for twelve minutes on this worker, and Shiny's
+    # asyncio loop runs in the SAME process. With no core left to schedule it the server cannot
+    # deliver a single output: the page freezes for the whole run -- no progress bar, no step text,
+    # not even the Run button re-rendering. That is what "I see no bar" was.
+    #
+    # Only when the count was auto-detected: an explicit threads= is the caller's decision. Set
+    # CTADIPO_RESERVE_CORE=0 to take the core back and accept a frozen page.
+    reserve = os.environ.get("CTADIPO_RESERVE_CORE", "1") not in ("0", "false", "no")
+    if auto and reserve and usable >= 2:
+        threads = usable - 1
+    else:
+        threads = usable
+    print("[ctadipo] cpus=%d torch_threads=%d%s"
+          % (usable, threads, "  (one reserved for the UI)" if threads < usable else ""),
+          flush=True)
     torch.set_num_threads(max(1, int(threads)))
     dev = torch.device(device)
     p = nnUNetPredictor(tile_step_size=step, use_gaussian=True, use_mirroring=bool(mirroring),

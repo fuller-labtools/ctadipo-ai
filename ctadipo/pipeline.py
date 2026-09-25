@@ -32,11 +32,46 @@ caller passes `lung_fn`; when it is absent that fact is reported, never passed o
 from __future__ import annotations
 
 import gc
+import os
 
 import numpy as np
 
 from . import preprocess as P
 from . import landmark_model as LMM
+
+def rss_gb():
+    """Resident memory, or 0.0 where psutil is absent. Printed at every stage so a container log
+    reports the real peak instead of leaving it to be inferred from the fact that it died."""
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / 1e9
+    except Exception:
+        try:
+            with open("/proc/self/statm") as fh:          # Linux fallback, no dependency
+                return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e9
+        except Exception:
+            return 0.0
+
+
+def trim_heap():
+    """Hand freed memory back to the kernel, which glibc does not do on its own.
+
+    THIS IS WHY THE DESKTOP MEASUREMENT DID NOT PREDICT THE WORKER. Dropping the segmenter frees
+    1.07 GB from Python's heap, and on Windows that showed up in RSS immediately -- peak measured
+    3.58 GB and the fix looked done. glibc instead keeps the freed arenas mapped for reuse, and the
+    container limit is enforced on RSS, not on what Python believes it is using. So the same code
+    that peaked at 3.58 GB locally entered the depot partition at 3.94 GB on the worker.
+
+    malloc_trim(0) releases the free top of the heap. It exists only in glibc, so musl containers
+    and Windows fall through the except and are no worse off than before.
+    """
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+        return True
+    except Exception:
+        return False
+
 
 DENSITY_G_PER_ML = 0.9          # adipose tissue; volumes convert to mass by simple density
 VOX_MM3 = P.ISO ** 3
@@ -96,6 +131,8 @@ def analyse(raw, segmenter, landmark_nets, *, lung_fn=None, device="cpu",
     is testable against stored predictions without a GPU or a 410 MB checkpoint.
     """
     def say(msg):
+        mem = rss_gb()
+        print("[ctadipo] %-38s rss %.2f GB" % (msg, mem), flush=True)
         if progress:
             progress(msg)
 
@@ -128,9 +165,15 @@ def analyse(raw, segmenter, landmark_nets, *, lung_fn=None, device="cpu",
 
     say("measuring fat")
     M = build_masks(raw, pred, lung_fn=lung_fn)
+    # M holds it from here on; the local was a second reference across the whole partition.
+    del pred
 
     say("placing landmarks")
     L = LMM.predict(raw, A, landmark_nets, device=device)
+    # The animal mask is finished with. depot_rules takes its animal from keep_largest3d(body),
+    # not from this, so it would otherwise sit through the partition for nothing.
+    del A
+    gc.collect()
 
     out = {
         "landmarks": L, "normalisation": {"mean": mean, "sd": sd},
@@ -154,7 +197,8 @@ def analyse(raw, segmenter, landmark_nets, *, lung_fn=None, device="cpu",
         # above are all still correct. Letting the exception escape would throw those away too and
         # hand the user a traceback after a seven-minute wait, so it is caught HERE and reported.
         try:
-            out["depots"] = partition(M, L, depot_rules, aid=aid, dorsal_is_low=dorsal_is_low)
+            out["depots"] = partition(M, L, depot_rules, aid=aid,
+                                      dorsal_is_low=dorsal_is_low, say=say)
         except Exception as e:
             out["depots_error"] = str(e)
     return out
@@ -172,10 +216,120 @@ def totals(M):
             "lung_region_mL": M["lung_mL"]}
 
 
-def partition(M, L, DR, aid="upload", dorsal_is_low=None):
+PARTITION_BYTES_PER_VOXEL = 24.0
+"""Peak bytes per voxel of the depot partition, measured not assumed.
+
+rule_A_slabs builds seventeen full-resolution boolean volumes and a distance transform in a single
+call. On a 540x529x529 scan (151.1 M voxels) that took the process from 3.5 GB to 7.1 GB.
+"""
+
+
+def _budget_check(shape0, shape1, say=None):
+    """Refuse a partition that cannot fit, rather than let the container SIGKILL the session.
+
+    The crop normally removes most of the field -- across forty cohort scans it kept a median of
+    22%, worst case 51% -- but that is a property of a mouse lying in a wide bore, not a guarantee.
+    A scan that arrives already trimmed tight to the animal cannot be reduced at all, and on an
+    8 GB worker the partition then runs the process into the ceiling. What the user sees when that
+    happens is the browser disconnecting after half an hour with no error and no result.
+
+    Raising here is caught by analyse(), which keeps the totals, the scanner band, the landmarks
+    and the QC flags and reports only the depots as unavailable. A partial answer that explains
+    itself beats a dead session.
+    """
+    n0, n1 = int(np.prod(shape0)), int(np.prod(shape1))
+    kept = 100.0 * n1 / max(n0, 1)
+    need = n1 * PARTITION_BYTES_PER_VOXEL / 1e9
+    now = rss_gb()
+    try:
+        budget = float(os.environ.get("CTADIPO_MEM_BUDGET_GB") or 6.1)
+    except ValueError:
+        budget = 16.0
+    if say:
+        say("cropped %s to %s, keeping %.0f%%" % (_sh(shape0), _sh(shape1), kept))
+        say("partition needs ~%.1f GB on top of %.1f GB (budget %.1f)" % (need, now, budget))
+    # rss_gb() returns 0.0 where it cannot measure; refusing on that would be refusing blind.
+    if now and now + need > budget:
+        raise MemoryError(
+            "the depot partition needs about %.1f GB on top of the %.1f GB already in use, over "
+            "the %.1f GB budget. This scan cropped to %s, %.0f%% of %s -- a volume that arrives "
+            "already trimmed to the animal cannot be cropped further. Total fat, VAT, SUBQ, the "
+            "landmarks and the QC checks are unaffected and are reported above."
+            % (need, now, budget, _sh(shape1), kept, _sh(shape0)))
+
+
+def _sh(s):
+    return "x".join(str(int(x)) for x in s)
+
+
+def crop_to_animal(M, lm, pad=2):
+    """Trim every volume to the animal's bounding box before the depot partition.
+
+    THIS IS THE DIFFERENCE BETWEEN FINISHING AND BEING OOM-KILLED. rule_A_slabs builds seventeen
+    full-resolution boolean volumes and a distance transform in one call; measured on a 540x529x529
+    scan that takes the process from 3.5 GB to 7.1 GB, and the container log for the first failed
+    run on an 8 GB worker says exactly "oom (out of memory)".
+
+    Almost all of that is air. A lean mouse in a wide bore fills about a TENTH of the field --
+    540x529x529 crops to 530x159x182 on one real scan -- so the partition's cost falls by ~90%, and
+    it runs about ten times faster too (31 s -> 3 s).
+
+    It cannot change a result: every depot is a subset of the animal by construction, and the frame
+    is built from relative quantities -- craniocaudal position from the mouse's own z extent, the
+    dorsoventral axis from the spine centroid. That is an argument rather than evidence, so it was
+    checked: on a real scan all ten depot volumes matched the full-volume partition to 0.00e+00,
+    every one.
+
+    IT MUST COPY, AND IT MUST EMPTY THE DICT IT WAS GIVEN. The first version of this function
+    did `v[sl]`, which is basic indexing and therefore a VIEW: every "cropped" array kept its
+    full-resolution base alive, so the partition iterated over a tenth of the data while the
+    process still held all of it. The depot volumes matched and the step ran ten times faster,
+    which is precisely why the bug survived review -- correctness and speed both looked right and
+    neither one measures bytes. The worker was OOM-killed anyway.
+
+    Popping each key as it is copied means only one full-resolution array is alive at a time, and
+    because the dict is the caller's own object it empties analyse()'s M as well; rebinding a
+    local would have left a second reference pinning all of it.
+
+    Returns (cropped masks, landmarks shifted into the crop, the z offset). THE MASKS PASSED IN
+    ARE CONSUMED.
+    """
+    mouse = P.keep_largest3d(M["body"])
+    # Three boolean reductions rather than argwhere, which would build an int64 index array of
+    # about 178 MB for a 7 M-voxel mouse -- at the moment the process is nearest its ceiling.
+    lo, hi = [], []
+    for ax in range(3):
+        nz = np.where(mouse.any(axis=tuple(i for i in range(3) if i != ax)))[0]
+        if nz.size == 0:
+            return M, lm, 0
+        lo.append(max(int(nz[0]) - pad, 0))
+        hi.append(min(int(nz[-1]) + 1 + pad, mouse.shape[ax]))
+    del mouse
+    gc.collect()
+    sl = tuple(slice(a, b) for a, b in zip(lo, hi))
+    Mc = {}
+    for k in list(M.keys()):
+        v = M.pop(k)
+        Mc[k] = v[sl].copy() if isinstance(v, np.ndarray) and v.ndim == 3 else v
+        del v
+    gc.collect()
+    z0 = lo[0]
+    lmc = {k: (None if v is None else v - z0) for k, v in lm.items()}
+    return Mc, lmc, z0
+
+
+def partition(M, L, DR, aid="upload", dorsal_is_low=None, say=None):
     """The ten depots, via rule_A_slabs against the model's landmarks."""
     lm = {slot: L["z"][name] for slot, name in LMM.DEPOT_ALIAS.items()}
     lm["_kidney_cranial"] = L["z"]["kidney_cranial"]
+    # frame() pops pred itself, so carrying it through the crop copies a full int volume for
+    # nothing. Dropping it here frees the original a step earlier as well.
+    M.pop("pred", None)
+    shape0 = M["body"].shape
+    M, lm, _z0 = crop_to_animal(M, lm)
+    gc.collect()
+    trim_heap()
+    _budget_check(shape0, M["body"].shape, say)
     F = DR.frame(aid, lm, L["direction"], masks=M, dorsal_is_low=dorsal_is_low)
     d = DR.rule_A_slabs(F)
     v = DR.volumes(d)                                    # mm^3
@@ -183,7 +337,15 @@ def partition(M, L, DR, aid="upload", dorsal_is_low=None):
     return {"mL": ten,
             "g": {k: x * DENSITY_G_PER_ML for k, x in ten.items()},
             "overlapping_mL": {k: v[k] / 1000.0 for k in OVERLAPPING if k in v},
-            "masks": d, "frame": F,
+            # Only the ten. The seven overlap masks are never meshed and never read -- their
+            # volumes are already in overlapping_mL above -- and the frame is read by nobody at
+            # all. Both used to be carried out of here and held through the mesh loop.
+            "masks": {k: d[k] for k in PARTITION_DEPOTS if k in d},
+            # The animal itself, CROPPED, for the 3-D view only. Ten depots floating in empty space
+            # give the viewer nothing to orient against -- no head, no dorsal side, no way to see
+            # that VAT sits inside the cavity and SUBQ outside it. This is display-only and is
+            # never counted; the app meshes it and drops it immediately.
+            "body": M["body"],
             "conservation": DR.check_partition(F, d)}
 
 
@@ -207,7 +369,12 @@ def quality_flags(M, L):
     # against wall on good scans versus 6-17% on bad ones, but never made that a gate. A lean scan
     # can clear 70 mm3 on wall volume and still sit at 0.29 here, which is worth showing the user --
     # as a second opinion, not as a second threshold that would quietly change what passes.
-    f["edge_on_wall_low"] = M["edge_on_wall"] < 0.45
+    # LOOSENED from 0.45. The review recorded 45-65% on good scans and 6-17% on bad ones; 0.45
+    # therefore flagged the entire gap between the two populations, so a scan at 0.36 -- nowhere
+    # near the bad range -- raised a warning next to a result whose conservation was exact. The
+    # threshold belongs just above the BAD range, so it fires for the failure it was built to
+    # catch and stays quiet across the gap.
+    f["edge_on_wall_low"] = M["edge_on_wall"] < 0.20
 
     f["direction"] = L["direction"]
     f["direction_margin_mm"] = L["direction_margin_mm"]
@@ -222,7 +389,16 @@ def quality_flags(M, L):
     # guessing which is wrong.
 
     f["landmark_spread_mm"] = L["spread_mm"]
-    f["landmark_uncertain"] = {k: v > 3.0 for k, v in L["spread_mm"].items()}
+    # LOOSENED from 3.0 mm. Measured p90 error per plane is 1.54-2.70 mm and a miss is defined
+    # elsewhere as >5 mm, so 3.0 sat inside the normal range and flagged three of five planes on a
+    # scan that partitioned cleanly. 6 mm is clear of both, so this now means "the model is lost",
+    # not "this scan is unfamiliar" -- which, for an app whose whole purpose is scans from other
+    # scanners, is the ordinary case.
+    #
+    # THE COST IS REAL: at 3.0 mm this caught 73% of the >5 mm errors while flagging 10.9% of
+    # scans. At 6 mm it catches fewer. That is the deliberate trade -- a panel that cries wolf is
+    # one the user stops reading.
+    f["landmark_uncertain"] = {k: v > 6.0 for k, v in L["spread_mm"].items()}
     # The model predicts a distribution over z, so a wide one is a genuine "this scan does not look
     # like the training data" signal rather than a confident answer from an unfamiliar image.
 

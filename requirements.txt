@@ -42,3 +42,6 @@ fast-simplification>=0.1
 
 # fetching the 410 MB checkpoint at first use
 requests>=2.31
+
+# so the container log reports real memory use at each stage rather than only that it died
+psutil>=5.9

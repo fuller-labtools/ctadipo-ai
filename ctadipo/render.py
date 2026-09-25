@@ -98,14 +98,15 @@ def largest_component(mask, keep=1):
     return np.isin(lbl, keep_ids)
 
 
-def plotly_mesh(v, f, colour, name, opacity=1.0):
+def plotly_mesh(v, f, colour, name, opacity=1.0, hover=True):
     """One plotly Mesh3d trace. z is the craniocaudal axis, so it is plotted as the vertical."""
     import plotly.graph_objects as go
     return go.Mesh3d(x=v[:, 2], y=v[:, 1], z=v[:, 0],
                      i=f[:, 0], j=f[:, 1], k=f[:, 2],
                      color=colour, opacity=opacity, name=name, showlegend=True,
                      lighting=dict(ambient=0.55, diffuse=0.85, specular=0.12, roughness=0.6),
-                     lightposition=dict(x=200, y=200, z=400), hoverinfo="name", flatshading=False)
+                     lightposition=dict(x=200, y=200, z=400),
+                     hoverinfo="name" if hover else "skip", flatshading=False)
 
 
 def scene(traces, title=""):
