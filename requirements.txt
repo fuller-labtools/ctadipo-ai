@@ -1,0 +1,44 @@
+# CTAdipo — pinned to the versions the models were trained and validated under.
+#
+# THE FIRST LINE IS LOAD-BEARING. torch 2.5.1 from plain PyPI is the CUDA build: a 906 MB wheel that
+# hard-pins twelve nvidia-cu12 packages and triton, about 3 GB of downloads and ~6 GB unpacked, none
+# of which is used because the app runs on CPU. The CPU wheel is 175 MB. An earlier version of this
+# file explained that in a comment and left the pin bare, which does nothing — pip does not read
+# comments. The extra index below is what actually selects the CPU build: it publishes
+# torch-2.5.1+cpu, and under PEP 440 a local version matches `==2.5.1` and sorts above the plain
+# PyPI release, so pip prefers it.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Python 3.10-3.12. Below 3.10 the `X | None` annotations fail at import; 3.13 has no wheel for
+# several pins here. shinyapps.io tops out at 3.12, so 3.12 is the target.
+
+shiny>=0.8
+pandas>=2.0
+numpy==2.0.1
+scipy==1.15.3
+Pillow>=9.5
+
+# volume I/O: DICOM series, NIfTI, TIFF, HDF5
+SimpleITK==2.5.3
+pydicom>=2.3
+tifffile>=2023.7.10
+h5py>=3.9
+
+# segmentation
+torch==2.5.1
+nnunetv2==2.8.0
+
+# 3-D renders. The paper figures use pyvista, which needs OpenGL and therefore cannot run on
+# shinyapps.io or Connect Cloud -- neither has a GPU or a display. So the server only builds the
+# MESH (marching cubes is pure C, no graphics context) and the browser draws it with WebGL via
+# plotly. That removes the OpenGL dependency entirely and the user gets to rotate the animal
+# instead of looking at a fixed camera.
+scikit-image>=0.21
+trimesh>=4.0
+plotly>=5.18
+# trimesh's quadric decimation needs this backend; without it the meshes ship undecimated and the
+# browser tab dies on a full-resolution subcutaneous shell.
+fast-simplification>=0.1
+
+# fetching the 410 MB checkpoint at first use
+requests>=2.31

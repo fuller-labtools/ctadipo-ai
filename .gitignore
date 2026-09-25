@@ -1,0 +1,15 @@
+# Deployment records are machine-specific (they name a local path and an app id).
+rsconnect-python/
+
+# The segmentation checkpoint is 410 MB and lives on Zenodo; the app fetches it on first use.
+nnunet/**/fold_*/checkpoint_*.pth
+
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+
+# Local scratch
+_tta/
+*.part
